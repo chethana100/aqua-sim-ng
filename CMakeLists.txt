@@ -46,6 +46,7 @@ build_lib(
         model/aqua-sim-routing-flooding.cc
         model/aqua-sim-routing-buffer.cc
         model/aqua-sim-routing-vbf.cc
+        model/aqua-sim-routing-trustq-vbf.cc
         model/aqua-sim-routing-dbr.cc
         model/aqua-sim-routing-vbva.cc
         model/aqua-sim-mobility-kinematic.cc
@@ -121,6 +122,7 @@ build_lib(
         model/aqua-sim-datastructure.h
         model/aqua-sim-routing-buffer.h
         model/aqua-sim-routing-vbf.h
+        model/aqua-sim-routing-trustq-vbf.h
         model/aqua-sim-routing-dbr.h
         model/aqua-sim-routing-vbva.h
         model/aqua-sim-mobility-kinematic.h
