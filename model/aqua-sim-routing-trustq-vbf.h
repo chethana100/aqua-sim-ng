@@ -87,6 +87,7 @@ private:
 
   // Passive neighbour position table: address -> (position, last-heard time).
   bool m_paperHoldTime;
+  bool m_paperDesirableness;   // [C] hold time uses HH-VBF Definition 2 alpha'
   struct NeighborInfo {
     Vector pos;
     double lastHeard;
@@ -108,6 +109,10 @@ private:
   // PACKET_SIZE in the scratch file.
   double TransmissionProbability (double distanceMeters) const;
   double ComputeChannelQuality (AquaSimAddress node);
+
+  // [C] HH-VBF desirableness factor, Definition 2 of Nicolaou et al.:
+  //     alpha' = (R - d cos(theta)) / R   (no p/W projection term)
+  double HhvbfDesirableness (Ptr<Packet> pkt, Vector f);
 
   double m_neighborStaleTime;     // seconds before a neighbour entry is ignored
   double m_observedTrustWeight;   // weight of observed trust in relay priority

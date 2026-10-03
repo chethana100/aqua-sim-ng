@@ -15,6 +15,8 @@
 #include "ns3/uinteger.h"
 #include "ns3/boolean.h"
 #include <string>
+#include <sstream>   // [C]
+#include <iomanip>   // [C]
  
 namespace ns3 {
  
@@ -126,9 +128,18 @@ AquaSimTrustQVBF::GetTypeId (void)
       DoubleValue (0.0),
       MakeDoubleAccessor (&AquaSimTrustQVBF::m_dropProbability),
       MakeDoubleChecker<double> (0.0, 1.0))
-    .AddAttribute ("PaperHoldTime", "Use HH-VBF paper holding time sqrt(a)*T + (R-d)/v",
-      BooleanValue (false),
+    .AddAttribute ("PaperHoldTime",
+      "[C] true (default): published VBF/HH-VBF holding time T = sqrt(alpha)*T_delay + (R-d)/v0. "
+      "false: legacy Aqua-Sim-NG sqrt(alpha)*T_delay + 2(d-R)/v0 (pre-rebaseline reproduction only).",
+      BooleanValue (true),
       MakeBooleanAccessor (&AquaSimTrustQVBF::m_paperHoldTime),
+      MakeBooleanChecker ())
+    .AddAttribute ("PaperDesirableness",
+      "[C] true (default): the HOLD TIME uses HH-VBF Definition 2 alpha' = (R - d cos(theta))/R. "
+      "false: the hold time uses the Aqua-Sim-NG alpha = p/W + (R - d cos(theta))/R. "
+      "The self-adaptation thresholds always use the Aqua-Sim-NG alpha (documented deviation).",
+      BooleanValue (true),
+      MakeBooleanAccessor (&AquaSimTrustQVBF::m_paperDesirableness),
       MakeBooleanChecker ())
     .AddAttribute ("ObservedTrustWeight",
       "Weight of observed (watchdog) trust in relay priority; 0 disables it",
@@ -175,7 +186,8 @@ AquaSimTrustQVBF::AquaSimTrustQVBF ()
 {
   NS_LOG_FUNCTION (this);
   m_dropRand = CreateObject<UniformRandomVariable> ();
-  m_paperHoldTime = false;
+  m_paperHoldTime = true;        // [C] default: published hold time
+  m_paperDesirableness = true;   // [C] default: HH-VBF Def. 2 alpha' for the hold time
   m_attackStart = 0.0;
   m_attackMode = 0;
   m_rampTime = 600.0;
@@ -368,6 +380,28 @@ AquaSimTrustQVBF::ProjectionFor (Ptr<Packet> pkt, Vector at)
   double len = std::sqrt (wx * wx + wy * wy + wz * wz);
   if (len <= 0.0) return 0.0;
   return area / len;
+}
+
+// [C] HH-VBF desirableness factor, Definition 2 (Nicolaou et al.):
+//     alpha' = (R - d cos(theta)) / R
+// d = distance from this node to the forwarder F (the stamped position f of the received copy),
+// theta = angle between F->sink and F->this node, R = transmission range. Unlike Aqua-Sim-NG's
+// CalculateDelay (VBF Definition 1) there is no p/W projection term. Degenerate cases follow
+// CalculateDelay's convention: d == 0 or |F->t| == 0 => cos(theta) = 0.
+double
+AquaSimTrustQVBF::HhvbfDesirableness (Ptr<Packet> pkt, Vector f)
+{
+  VBHeader vbh; AquaSimHeader ash;
+  pkt->RemoveHeader (ash); pkt->PeekHeader (vbh); pkt->AddHeader (ash);
+  Vector t = vbh.GetExtraInfo ().t;
+  Vector me = GetNetDevice ()->GetPosition ();
+  double dx = me.x - f.x, dy = me.y - f.y, dz = me.z - f.z;
+  double tx = t.x - f.x, ty = t.y - f.y, tz = t.z - f.z;
+  double d = std::sqrt (dx * dx + dy * dy + dz * dz);
+  double l = std::sqrt (tx * tx + ty * ty + tz * tz);
+  double cosTheta = (d == 0.0 || l == 0.0) ? 0.0 : (dx * tx + dy * ty + dz * tz) / (d * l);
+  double range = m_device->GetPhy ()->GetTransRange ();
+  return (range - d * cosTheta) / range;
 }
 
 double
@@ -657,6 +691,11 @@ AquaSimTrustQVBF::CheckWatchTimeout (AquaSimAddress origSrc, uint32_t pkNum)
       if (it->second.expectedValid)
         {
           NS_LOG_UNCOND ("[OBSERVER] TIMEOUT exp=" << it->second.watchedNode);
+          NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << origSrc.GetAsInt () << " pk=" << pkNum << " prev=" << it->second.fwdAddr << " watched=" << it->second.watchedNode.GetAsInt () << " tx=0 kind=TIMEOUT t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
+        }
+      else
+        {
+          NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << origSrc.GetAsInt () << " pk=" << pkNum << " prev=" << it->second.fwdAddr << " watched=" << it->second.watchedNode.GetAsInt () << " tx=0 kind=NOEXP_TIMEOUT t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
         }
     }
   m_pktWatch.erase (it);
@@ -813,6 +852,7 @@ AquaSimTrustQVBF::Recv (Ptr<Packet> packet, const Address &dest, uint16_t protoc
                   double w = ComputePactWeight (wit->second.watchedNode);
                   NS_LOG_UNCOND ("[PACT] node=" << wit->second.watchedNode << " weight=" << w);
                   UpdateObservedTrust (wit->second.watchedNode, true, w);
+                  NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << "CREDIT" << " w=" << w << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
                 }
               else
                 {
@@ -821,10 +861,12 @@ AquaSimTrustQVBF::Recv (Ptr<Packet> packet, const Address &dest, uint16_t protoc
                   if (ee < EnvThreshold ())
                     {
                       NS_LOG_UNCOND ("[EAQTE-FREEZE] node=" << wit->second.watchedNode << " EE=" << ee << " -- update skipped");
+                      NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << "CREDIT_FROZEN" << " ee=" << ee << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
                     }
                   else
                     {
                       UpdateObservedTrust (wit->second.watchedNode, true);
+                      NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << "CREDIT" << " ee=" << ee << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
                     }
                 }
             }
@@ -834,6 +876,7 @@ AquaSimTrustQVBF::Recv (Ptr<Packet> packet, const Address &dest, uint16_t protoc
               if (actFire < 0.0)
                 {
                   NS_LOG_UNCOND ("[OBSERVER] MODELMISS exp=" << wit->second.watchedNode << " act=" << vbh.GetForwardAddr () << " why=" << actFire);
+                  NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << "MODELMISS" << " why=" << actFire << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
                 }
               else if (actFire > wit->second.expFire + 0.005)
                 {
@@ -845,6 +888,7 @@ AquaSimTrustQVBF::Recv (Ptr<Packet> packet, const Address &dest, uint16_t protoc
                       NS_LOG_UNCOND ("[PACT] node=" << vbh.GetForwardAddr () << " weight=" << wCredited << " (credit)");
                       UpdateObservedTrust (wit->second.watchedNode, false, wBlamed);
                       UpdateObservedTrust (vbh.GetForwardAddr (), true, wCredited);
+                      NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << "BLAME" << " wb=" << wBlamed << " wc=" << wCredited << " gap=" << (actFire - wit->second.expFire) << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
                     }
                   else
                     {
@@ -868,15 +912,21 @@ AquaSimTrustQVBF::Recv (Ptr<Packet> packet, const Address &dest, uint16_t protoc
                         {
                           UpdateObservedTrust (vbh.GetForwardAddr (), true);
                         }
+                      NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << "BLAME" << " eeb=" << eeBlamed << " eec=" << eeCredited << " bfrz=" << (eeBlamed < EnvThreshold ()) << " cfrz=" << (eeCredited < EnvThreshold ()) << " gap=" << (actFire - wit->second.expFire) << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
                     }
                   NS_LOG_UNCOND ("[OBSERVER] DEVIATION exp=" << wit->second.watchedNode << " act=" << vbh.GetForwardAddr () << " gap=" << (actFire - wit->second.expFire));
                 }
               else
                 {
                   NS_LOG_UNCOND ("[OBSERVER] TIE exp=" << wit->second.watchedNode << " act=" << vbh.GetForwardAddr ());
+                  NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << "TIE" << " gap=" << (actFire - wit->second.expFire) << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
                 }
             }
           wit->second.resolved = true;
+        }
+      else if (wit != m_pktWatch.end ())  // [DIAG] logging only
+        {
+          NS_LOG_UNCOND ("[VERDICT] obs=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " prev=" << wit->second.fwdAddr << " watched=" << wit->second.watchedNode.GetAsInt () << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " kind=" << (wit->second.resolved ? "DUP_AFTER" : (!wit->second.expectedValid ? "DUP_NOEXP" : "DUP_NOTAG")) << " tag=" << hasTag << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
         }
  
       PktTable.PutInHash (vbh.GetSenderAddr (), vbh.GetPkNum (), vbh.GetExtraInfo ().f);
@@ -966,6 +1016,7 @@ AquaSimTrustQVBF::ConsiderNewTrustAware (Ptr<Packet> pkt)
  
   if (GetNetDevice ()->GetAddress () == from_nodeAddr)
     {
+      NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=ORIGIN n=" << 0 << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
       MACprepare (pkt);
       MACsend (pkt, 0);
       return;
@@ -974,6 +1025,7 @@ AquaSimTrustQVBF::ConsiderNewTrustAware (Ptr<Packet> pkt)
   if (GetNetDevice ()->GetAddress () == vbh.GetTargetAddr ())
     {
       NS_LOG_UNCOND ("[EAQTE] RX src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " t=" << Simulator::Now ().GetSeconds ());
+      NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=SINK n=" << 0 << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
       DataForSink (pkt);
       return;
     }
@@ -984,13 +1036,22 @@ AquaSimTrustQVBF::ConsiderNewTrustAware (Ptr<Packet> pkt)
       p1[0].x = vbh.GetExtraInfo ().f.x;
       p1[0].y = vbh.GetExtraInfo ().f.y;
       p1[0].z = vbh.GetExtraInfo ().f.z;
-      double baseDelay = CalculateDelay (pkt, p1);
+      double baseDelay = CalculateDelay (pkt, p1);   // Aqua-Sim-NG alpha (VBF Def. 1); unchanged
       delete[] p1;
  
+      // [C] Desirableness used for the HOLD TIME. Default: HH-VBF Definition 2 alpha'.
+      // The Aqua-Sim-NG alpha above is still what TimeoutTrustAware's self-adaptation
+      // thresholds use (documented implementation deviation, RESEARCH_DECISIONS D-07).
+      double holdAlpha = m_paperDesirableness ? HhvbfDesirableness (pkt, vbh.GetExtraInfo ().f) : baseDelay;
+      if (!(holdAlpha >= 0.0))   // [C] defensive guard only (D-03): negative or NaN is outside d <= R
+        {
+          NS_LOG_UNCOND ("[GUARD] holdAlpha clamped node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " alpha=" << holdAlpha << " t=" << Simulator::Now ().GetSeconds ());
+          holdAlpha = 0.0;
+        }
       double d2 = (Distance (pkt) - m_device->GetPhy ()->GetTransRange ()) / ns3::SOUND_SPEED_IN_WATER;
       double hhvbfDelay = m_paperHoldTime
-        ? (sqrt (baseDelay) * DELAY + (m_device->GetPhy ()->GetTransRange () - Distance (pkt)) / ns3::SOUND_SPEED_IN_WATER)
-        : (sqrt (baseDelay) * DELAY + d2 * 2);
+        ? (sqrt (holdAlpha) * DELAY + (m_device->GetPhy ()->GetTransRange () - Distance (pkt)) / ns3::SOUND_SPEED_IN_WATER)
+        : (sqrt (holdAlpha) * DELAY + d2 * 2);
  
       double pht = GetNeighborObservedTrust (vbh.GetSenderAddr ());
       double trustTerm = (1.0 - m_observedTrustWeight) * m_selfTrust + m_observedTrustWeight * (1.0 - pht);
@@ -1045,10 +1106,14 @@ AquaSimTrustQVBF::ConsiderNewTrustAware (Ptr<Packet> pkt)
           finalDelay = 0.0;
         }
  
+      NS_LOG_UNCOND ("[HOLD] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " base=" << baseDelay << " hh=" << hhvbfDelay << " final=" << finalDelay << " t=" << Simulator::Now ().GetSeconds ()
+                     << [&] { std::ostringstream x; x << std::setprecision (17) << " halpha=" << holdAlpha << " d=" << Distance (pkt)
+                              << " hhx=" << hhvbfDelay << " finx=" << finalDelay << " tx=" << Simulator::Now ().GetSeconds (); return x.str (); } ());  // [DIAG] [C] full precision
       SetDelayTimerTrustAware (pkt, finalDelay);
     }
   else
     {
+      NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=OUTPIPE n=" << 0 << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
       pkt = 0;
     }
 }
@@ -1080,6 +1145,7 @@ AquaSimTrustQVBF::TimeoutTrustAware (Ptr<Packet> pkt)
  
   if (hashPtr == NULL)
     {
+      NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=NOHASH n=" << 0 << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
       return;
     }
  
@@ -1089,6 +1155,7 @@ AquaSimTrustQVBF::TimeoutTrustAware (Ptr<Packet> pkt)
     {
       if (num_neighbor == MAX_NEIGHBOR)
         {
+          NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=MAXNBR n=" << num_neighbor << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
           pkt = 0;
           return;
         }
@@ -1138,6 +1205,7 @@ AquaSimTrustQVBF::TimeoutTrustAware (Ptr<Packet> pkt)
                   selfMob->TriggerReversal (1.5);
                 }
               m_timesDropped++; NS_LOG_UNCOND ("[OBSERVER] DROP node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()) << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " t=" << Simulator::Now ().GetSeconds ());
+              NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=DROP n=" << num_neighbor << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
               pkt = 0;
               return;
             }
@@ -1149,12 +1217,14 @@ AquaSimTrustQVBF::TimeoutTrustAware (Ptr<Packet> pkt)
             ct.prev = cvb.GetForwardAddr ().GetAsInt ();
             pkt->AddByteTag (ct);
           }
+          NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=FWD n=" << num_neighbor << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
           MACprepare (pkt);
           MACsend (pkt, 0);
           UpdateSelfTrust (true);
         }
       else
         {
+          NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=SUPPRESS n=" << num_neighbor << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
           pkt = 0;
         }
     }
@@ -1184,6 +1254,7 @@ AquaSimTrustQVBF::TimeoutTrustAware (Ptr<Packet> pkt)
                   selfMob->TriggerReversal (1.5);
                 }
               m_timesDropped++; NS_LOG_UNCOND ("[OBSERVER] DROP node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()) << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " t=" << Simulator::Now ().GetSeconds ());
+              NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=DROP n=" << num_neighbor << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
               pkt = 0;
               return;
             }
@@ -1195,12 +1266,14 @@ AquaSimTrustQVBF::TimeoutTrustAware (Ptr<Packet> pkt)
             ct.prev = cvb.GetForwardAddr ().GetAsInt ();
             pkt->AddByteTag (ct);
           }
+          NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=FWD n=" << num_neighbor << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
           MACprepare (pkt);
           MACsend (pkt, 0);
           UpdateSelfTrust (true);
         }
       else
         {
+          NS_LOG_UNCOND ("[DECISION] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum () << " up=" << vbh.GetForwardAddr ().GetAsInt () << " act=INELIG n=" << num_neighbor << " t=" << Simulator::Now ().GetSeconds ());  // [DIAG]
           pkt = 0;
         }
     }
