@@ -739,6 +739,14 @@ AquaSimTrustQVBF::Recv (Ptr<Packet> packet, const Address &dest, uint16_t protoc
   else
     {
       packet->PeekHeader (vbh);
+      // [RXHDR] logging only: exact decoded on-air header fields of a received copy (Stage E O1 input)
+      NS_LOG_UNCOND ([&] { std::ostringstream x; x << std::setprecision (17)
+                       << "[RXHDR] node=" << AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()).GetAsInt ()
+                       << " tx=" << vbh.GetForwardAddr ().GetAsInt () << " src=" << vbh.GetSenderAddr ().GetAsInt () << " pk=" << vbh.GetPkNum ()
+                       << " f=" << vbh.GetExtraInfo ().f.x << ":" << vbh.GetExtraInfo ().f.y << ":" << vbh.GetExtraInfo ().f.z
+                       << " d=" << vbh.GetExtraInfo ().d.x << ":" << vbh.GetExtraInfo ().d.y << ":" << vbh.GetExtraInfo ().d.z
+                       << " tgt=" << vbh.GetExtraInfo ().t.x << ":" << vbh.GetExtraInfo ().t.y << ":" << vbh.GetExtraInfo ().t.z
+                       << " t=" << Simulator::Now ().GetSeconds (); return x.str (); } ());
     }
  
   packet->AddHeader (ash);
